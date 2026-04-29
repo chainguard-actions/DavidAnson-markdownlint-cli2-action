@@ -1,6 +1,12 @@
 # DavidAnson/markdownlint-cli2-action
 
-Hardened GitHub Action by [Chainguard](https://www.chainguard.dev).
+Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at [https://github.com/DavidAnson/markdownlint-cli2-action](https://github.com/DavidAnson/markdownlint-cli2-action).
+
+## Versions
+
+| Version | Tag | Upstream commit |
+|---------|-----|-----------------|
+| v23.0.0 | [`v23.0.0`](https://github.com/chainguard-actions/markdownlint-cli2-action/tree/v23.0.0) | — |
 
 ## Privacy
 
