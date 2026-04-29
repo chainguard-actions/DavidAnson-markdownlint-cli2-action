@@ -1,5 +1,7 @@
 # DavidAnson/markdownlint-cli2-action
 
+A GitHub Action to run the markdownlint-cli2 tool for linting Markdown/CommonMark files with the markdownlint library
+
 Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at [https://github.com/DavidAnson/markdownlint-cli2-action](https://github.com/DavidAnson/markdownlint-cli2-action).
 
 ## Versions
