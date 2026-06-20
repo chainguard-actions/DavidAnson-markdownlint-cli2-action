@@ -9,6 +9,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | Version | Tag | Upstream commit |
 |---------|-----|-----------------|
 | v23.0.0 | [`v23.0.0`](https://github.com/chainguard-actions/DavidAnson-markdownlint-cli2-action/tree/v23.0.0) | — |
+| v23.2.0 | [`v23.2.0`](https://github.com/chainguard-actions/DavidAnson-markdownlint-cli2-action/tree/v23.2.0) | [`ded1f94`](https://github.com/DavidAnson/markdownlint-cli2-action/commit/ded1f9488f68a970bc66ea5619e13e9b52e601cd) |
 
 ## Privacy
 
