@@ -1,0 +1,7 @@
+{
+  "default": true,
+  "line-length": false,
+  "proper-names": false,
+  "fenced-code-language": false,
+  "link-image-style": false
+}

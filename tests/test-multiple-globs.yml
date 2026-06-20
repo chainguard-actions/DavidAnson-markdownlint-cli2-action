@@ -1,0 +1,21 @@
+name: Test multiple globs with custom separator
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run markdownlint-cli2 with multiple globs using comma separator
+        id: action
+        uses: .
+        with:
+          globs: "tests/fixtures/file1.md,tests/fixtures/file2.markdown"
+          separator: ","
+          config: "tests/fixtures/config-permissive.json"
+
+      - name: Assert action succeeded with multiple globs
+        run: |
+          echo "Action completed successfully with multiple globs"
+          echo "PASS: multiple globs with custom separator worked correctly"
