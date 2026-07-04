@@ -10,6 +10,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 |---------|-----|-----------------|
 | v23.0.0 | [`v23.0.0`](https://github.com/chainguard-actions/DavidAnson-markdownlint-cli2-action/tree/v23.0.0) | — |
 | v23.2.0 | [`v23.2.0`](https://github.com/chainguard-actions/DavidAnson-markdownlint-cli2-action/tree/v23.2.0) | [`ded1f94`](https://github.com/DavidAnson/markdownlint-cli2-action/commit/ded1f9488f68a970bc66ea5619e13e9b52e601cd) |
+| v24.0.0 | [`v24.0.0`](https://github.com/chainguard-actions/DavidAnson-markdownlint-cli2-action/tree/v24.0.0) | [`8de2aa0`](https://github.com/DavidAnson/markdownlint-cli2-action/commit/8de2aa07cae85fd17c0b35642db70cf5495f1d25) |
 
 ## Privacy
 
