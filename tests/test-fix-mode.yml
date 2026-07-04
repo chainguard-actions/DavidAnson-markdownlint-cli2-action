@@ -1,0 +1,41 @@
+name: Test fix mode - auto-fix supported issues
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Copy fixture to a writable temp location for fix test
+        run: |
+          cp "$GITHUB_WORKSPACE/tests/fixtures/fail/trailing-spaces.md" "$GITHUB_WORKSPACE/tests/fixtures/fail/fixable-test.md"
+
+      - name: Verify trailing spaces exist before fix
+        run: |
+          if grep -P ' +$' "$GITHUB_WORKSPACE/tests/fixtures/fail/fixable-test.md"; then
+            echo "Confirmed: trailing spaces present before fix"
+          else
+            echo "FAIL: expected trailing spaces in fixture file"
+            exit 1
+          fi
+
+      - name: Run markdownlint-cli2-action with fix enabled
+        id: action
+        uses: .
+        with:
+          globs: tests/fixtures/fail/fixable-test.md
+          fix: 'true'
+
+      - name: Assert action succeeded after fixing
+        run: |
+          echo "Action completed successfully with fix mode enabled"
+          echo "PASS"
+
+      - name: Verify trailing spaces were removed
+        run: |
+          if grep -P ' +$' "$GITHUB_WORKSPACE/tests/fixtures/fail/fixable-test.md"; then
+            echo "FAIL: trailing spaces still present after fix"
+            exit 1
+          fi
+          echo "PASS: trailing spaces were removed by fix mode"

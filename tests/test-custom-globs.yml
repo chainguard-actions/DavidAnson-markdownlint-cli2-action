@@ -1,0 +1,21 @@
+name: Test custom globs - multiple patterns
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run markdownlint-cli2-action with custom globs for fixture docs
+        id: action
+        uses: .
+        with:
+          globs: |
+            tests/fixtures/docs/*.md
+            tests/fixtures/docs/*.markdown
+
+      - name: Assert action succeeded
+        run: |
+          echo "Action completed successfully with custom globs"
+          echo "PASS"
