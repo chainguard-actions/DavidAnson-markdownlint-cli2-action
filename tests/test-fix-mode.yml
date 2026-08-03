@@ -1,0 +1,44 @@
+name: Test fix mode - auto-fix supported issues
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create markdown file with fixable issues and local config
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-fix-mode"
+          # MD009: trailing spaces (fixable)
+          printf '# Heading\n\nSome text with trailing spaces   \n\nMore content.\n' \
+            > "$GITHUB_WORKSPACE/tests/tmp-fix-mode/fixable.md"
+          # Local .markdownlint.json that enables only MD009 (trailing spaces).
+          # Explicitly disables all other rules including those from the root config.
+          # This takes precedence over the root .markdownlint.json.
+          printf '%s\n' '{"default":false,"code-block-style":false,"code-fence-style":false,"emphasis-style":false,"fenced-code-language":false,"heading-style":false,"hr-style":false,"line-length":false,"link-image-style":false,"no-duplicate-heading":false,"ol-prefix":false,"proper-names":false,"strong-style":false,"table-pipe-style":false,"ul-style":false,"MD009":true}' \
+            > "$GITHUB_WORKSPACE/tests/tmp-fix-mode/.markdownlint.json"
+
+      - name: Verify file has trailing spaces before fix
+        run: |
+          if grep -P ' +$' "$GITHUB_WORKSPACE/tests/tmp-fix-mode/fixable.md"; then
+            echo "Confirmed: file has trailing spaces before fix"
+          else
+            echo "WARNING: could not detect trailing spaces"
+          fi
+
+      - id: action
+        uses: .
+        with:
+          globs: "tests/tmp-fix-mode/fixable.md"
+          fix: "true"
+
+      - name: Assert trailing spaces were removed after fix
+        run: |
+          echo "Checking file content after fix:"
+          cat "$GITHUB_WORKSPACE/tests/tmp-fix-mode/fixable.md"
+          if grep -P ' +$' "$GITHUB_WORKSPACE/tests/tmp-fix-mode/fixable.md"; then
+            echo "FAIL: trailing spaces still present after fix"
+            exit 1
+          fi
+          echo "PASS: trailing spaces were removed by fix mode"

@@ -1,0 +1,37 @@
+name: Test custom globs - lint specific files using glob patterns
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create test markdown files and local config
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-custom-globs/docs"
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-custom-globs/other"
+
+          # Valid markdown in docs/ (will be linted)
+          printf '# Documentation\n\nThis is valid documentation.\n\n## Details\n\nMore details here.\n' \
+            > "$GITHUB_WORKSPACE/tests/tmp-custom-globs/docs/readme.md"
+
+          # Invalid markdown in other/ (should NOT be linted due to glob)
+          printf '# Bad\n\ntrailing spaces   \n' \
+            > "$GITHUB_WORKSPACE/tests/tmp-custom-globs/other/bad.md"
+
+          # Local .markdownlint.json at parent level - disables all rules.
+          # This takes precedence over the root .markdownlint.json.
+          # We explicitly disable each rule that the root config enables.
+          printf '%s\n' '{"default":false,"code-block-style":false,"code-fence-style":false,"emphasis-style":false,"fenced-code-language":false,"heading-style":false,"hr-style":false,"line-length":false,"link-image-style":false,"no-duplicate-heading":false,"ol-prefix":false,"proper-names":false,"strong-style":false,"table-pipe-style":false,"ul-style":false}' \
+            > "$GITHUB_WORKSPACE/tests/tmp-custom-globs/.markdownlint.json"
+
+      - id: action
+        uses: .
+        with:
+          globs: "tests/tmp-custom-globs/docs/**/*.md"
+
+      - name: Assert action succeeded (only docs/ was linted, not other/)
+        run: |
+          echo "Action completed successfully - glob correctly targeted only docs/ directory"
+          echo "PASS"

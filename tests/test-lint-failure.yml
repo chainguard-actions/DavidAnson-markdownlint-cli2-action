@@ -1,0 +1,38 @@
+name: Test lint failure - invalid markdown causes action to fail
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create invalid markdown file and local config
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-lint-failure"
+          # Create a file with trailing spaces (MD009) - a clear lint error
+          printf '# Heading\n\nSome text with trailing spaces   \n\nMore text.\n' \
+            > "$GITHUB_WORKSPACE/tests/tmp-lint-failure/invalid.md"
+          # Local .markdownlint.json that enables only MD009 (trailing spaces).
+          # Explicitly disables all other rules including those from the root config.
+          # This takes precedence over the root .markdownlint.json.
+          # The file has trailing spaces, so MD009 will trigger a failure.
+          printf '%s\n' '{"default":false,"code-block-style":false,"code-fence-style":false,"emphasis-style":false,"fenced-code-language":false,"heading-style":false,"hr-style":false,"line-length":false,"link-image-style":false,"no-duplicate-heading":false,"ol-prefix":false,"proper-names":false,"strong-style":false,"table-pipe-style":false,"ul-style":false,"MD009":true}' \
+            > "$GITHUB_WORKSPACE/tests/tmp-lint-failure/.markdownlint.json"
+
+      - id: action
+        uses: .
+        with:
+          globs: "tests/tmp-lint-failure/invalid.md"
+        continue-on-error: true
+
+      - name: Assert action failed due to lint errors
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "FAIL: expected action to fail on invalid markdown, but outcome was '$OUTCOME'"
+            exit 1
+          fi
+          echo "PASS: action correctly failed on invalid markdown"

@@ -1,0 +1,37 @@
+name: Test separator - use custom separator for globs input
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create valid markdown files and local config
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-separator/a"
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-separator/b"
+
+          printf '# File One\n\nThis is the first valid markdown file.\n\n## Section\n\nContent here.\n' \
+            > "$GITHUB_WORKSPACE/tests/tmp-separator/a/file1.md"
+
+          printf '# File Two\n\nThis is the second valid markdown file.\n\n## Section\n\nContent here.\n' \
+            > "$GITHUB_WORKSPACE/tests/tmp-separator/b/file2.md"
+
+          # Local .markdownlint.json that disables all rules.
+          # This takes precedence over the root .markdownlint.json in the
+          # action directory, which has strict rules enabled.
+          # We explicitly disable each rule that the root config enables.
+          printf '%s\n' '{"default":false,"code-block-style":false,"code-fence-style":false,"emphasis-style":false,"fenced-code-language":false,"heading-style":false,"hr-style":false,"line-length":false,"link-image-style":false,"no-duplicate-heading":false,"ol-prefix":false,"proper-names":false,"strong-style":false,"table-pipe-style":false,"ul-style":false}' \
+            > "$GITHUB_WORKSPACE/tests/tmp-separator/.markdownlint.json"
+
+      - id: action
+        uses: .
+        with:
+          globs: "tests/tmp-separator/a/**/*.md,tests/tmp-separator/b/**/*.md"
+          separator: ","
+
+      - name: Assert action succeeded with comma-separated globs
+        run: |
+          echo "Action completed successfully - comma separator correctly split globs"
+          echo "PASS"

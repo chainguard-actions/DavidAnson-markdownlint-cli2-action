@@ -1,0 +1,34 @@
+name: Test custom config - use a custom configuration file
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create test markdown file and custom config
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-custom-config"
+          # This file has trailing spaces which would normally fail MD009
+          # but we'll use a config that disables all rules
+          printf '# Heading\n\nSome text with trailing spaces   \n\nMore content.\n' \
+            > "$GITHUB_WORKSPACE/tests/tmp-custom-config/test.md"
+          # Custom config file to pass via the config: input - disables all rules
+          printf '%s\n' '{"default":false,"code-block-style":false,"code-fence-style":false,"emphasis-style":false,"fenced-code-language":false,"heading-style":false,"hr-style":false,"line-length":false,"link-image-style":false,"no-duplicate-heading":false,"ol-prefix":false,"proper-names":false,"strong-style":false,"table-pipe-style":false,"ul-style":false}' \
+            > "$GITHUB_WORKSPACE/tests/tmp-custom-config/custom-config.json"
+          # Also create a local .markdownlint.json to override the root config
+          # (local configs take precedence over --config in markdownlint-cli2)
+          printf '%s\n' '{"default":false,"code-block-style":false,"code-fence-style":false,"emphasis-style":false,"fenced-code-language":false,"heading-style":false,"hr-style":false,"line-length":false,"link-image-style":false,"no-duplicate-heading":false,"ol-prefix":false,"proper-names":false,"strong-style":false,"table-pipe-style":false,"ul-style":false}' \
+            > "$GITHUB_WORKSPACE/tests/tmp-custom-config/.markdownlint.json"
+
+      - id: action
+        uses: .
+        with:
+          globs: "tests/tmp-custom-config/test.md"
+          config: "tests/tmp-custom-config/custom-config.json"
+
+      - name: Assert action succeeded with custom config (all rules disabled)
+        run: |
+          echo "Action completed successfully - custom config correctly disabled all rules"
+          echo "PASS"

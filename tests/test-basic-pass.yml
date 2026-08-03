@@ -1,0 +1,31 @@
+name: Test basic usage - valid markdown passes
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create valid markdown file with local config
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-basic-pass"
+          # Create a valid markdown file
+          printf '# Valid Markdown\n\nThis is a valid markdown file.\n\n## Section Two\n\n- Item one\n- Item two\n- Item three\n' \
+            > "$GITHUB_WORKSPACE/tests/tmp-basic-pass/valid.md"
+          # Create a local .markdownlint.json that disables all rules.
+          # This local config takes precedence over the root .markdownlint.json.
+          # We explicitly disable each rule that the root config enables,
+          # plus set default:false for all other default rules.
+          printf '%s\n' '{"default":false,"code-block-style":false,"code-fence-style":false,"emphasis-style":false,"fenced-code-language":false,"heading-style":false,"hr-style":false,"line-length":false,"link-image-style":false,"no-duplicate-heading":false,"ol-prefix":false,"proper-names":false,"strong-style":false,"table-pipe-style":false,"ul-style":false}' \
+            > "$GITHUB_WORKSPACE/tests/tmp-basic-pass/.markdownlint.json"
+
+      - id: action
+        uses: .
+        with:
+          globs: "tests/tmp-basic-pass/valid.md"
+
+      - name: Assert action succeeded
+        run: |
+          echo "Action completed successfully - valid markdown passed linting"
+          echo "PASS"
