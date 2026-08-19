@@ -1,0 +1,45 @@
+name: Test fix mode - auto-fix supported issues
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create markdown file with fixable issues (trailing spaces - MD009)
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-fix-mode"
+          # MD009: Trailing spaces - this is fixable
+          # Use printf to create a file with trailing spaces
+          printf '# Heading\n\nSome text with trailing spaces   \n\nMore text   \n' \
+            > "$GITHUB_WORKSPACE/tests/tmp-fix-mode/fixable.md"
+          echo "Before fix:"
+          cat -A "$GITHUB_WORKSPACE/tests/tmp-fix-mode/fixable.md"
+
+      - name: Create config that only enables MD009 (trailing spaces)
+        run: |
+          cat > "$GITHUB_WORKSPACE/tests/tmp-fix-mode/.markdownlint.json" << 'EOF'
+          {
+            "default": false,
+            "MD009": true
+          }
+          EOF
+
+      - id: action
+        uses: .
+        with:
+          globs: "tests/tmp-fix-mode/fixable.md"
+          config: "tests/tmp-fix-mode/.markdownlint.json"
+          fix: "true"
+
+      - name: Assert trailing spaces were fixed
+        run: |
+          echo "After fix:"
+          cat -A "$GITHUB_WORKSPACE/tests/tmp-fix-mode/fixable.md"
+          # Check that trailing spaces have been removed
+          if grep -P ' +$' "$GITHUB_WORKSPACE/tests/tmp-fix-mode/fixable.md"; then
+            echo "FAIL: trailing spaces still present after fix"
+            exit 1
+          fi
+          echo "PASS: trailing spaces were removed by fix mode"

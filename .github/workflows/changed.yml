@@ -1,0 +1,22 @@
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      with:
+        fetch-depth: 0
+    - uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62 # v47
+      id: changed-files
+      with:
+        files: '**/*.md'
+        separator: ","
+    - uses: DavidAnson/markdownlint-cli2-action@ded1f9488f68a970bc66ea5619e13e9b52e601cd # v23
+      if: steps.changed-files.outputs.any_changed == 'true'
+      with:
+        globs: ${{ steps.changed-files.outputs.all_changed_files }}
+        separator: ","

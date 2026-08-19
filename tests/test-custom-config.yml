@@ -1,0 +1,34 @@
+name: Test custom config - config file disables rules
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create markdown file that would fail without custom config
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-custom-config"
+          # This file has no top-level heading (MD041) and other issues
+          # that would normally fail, but we'll disable all rules via config
+          printf 'some text without a heading\n\nmore text\n' \
+            > "$GITHUB_WORKSPACE/tests/tmp-custom-config/test.md"
+
+      - name: Create custom config that disables all rules
+        run: |
+          cat > "$GITHUB_WORKSPACE/tests/tmp-custom-config/.markdownlint.json" << 'EOF'
+          {
+            "default": false
+          }
+          EOF
+
+      - id: action
+        uses: .
+        with:
+          globs: "tests/tmp-custom-config/test.md"
+          config: "tests/tmp-custom-config/.markdownlint.json"
+
+      - name: Assert action succeeded with custom config disabling all rules
+        run: |
+          echo "PASS: action succeeded - custom config correctly disabled all rules"

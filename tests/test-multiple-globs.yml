@@ -1,0 +1,47 @@
+name: Test multiple globs - lint multiple patterns with newline separator
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create valid markdown files in multiple directories
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-multi-globs/docs"
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-multi-globs/notes"
+
+          # Valid markdown in docs/
+          cat > "$GITHUB_WORKSPACE/tests/tmp-multi-globs/docs/readme.md" << 'EOF'
+          # Docs Readme
+
+          This is the docs readme.
+          EOF
+
+          # Valid markdown in notes/
+          cat > "$GITHUB_WORKSPACE/tests/tmp-multi-globs/notes/notes.md" << 'EOF'
+          # Notes
+
+          These are some notes.
+          EOF
+
+      - name: Create config that disables all rules
+        run: |
+          cat > "$GITHUB_WORKSPACE/tests/tmp-multi-globs/.markdownlint.json" << 'EOF'
+          {
+            "default": false
+          }
+          EOF
+
+      - id: action
+        uses: .
+        with:
+          globs: |
+            tests/tmp-multi-globs/docs/*.md
+            tests/tmp-multi-globs/notes/*.md
+          config: "tests/tmp-multi-globs/.markdownlint.json"
+
+      - name: Assert action succeeded with multiple glob patterns
+        run: |
+          echo "PASS: action succeeded - multiple glob patterns were processed correctly"

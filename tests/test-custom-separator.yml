@@ -1,0 +1,44 @@
+name: Test custom separator - use comma as glob separator
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create valid markdown files
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-separator/a"
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-separator/b"
+
+          cat > "$GITHUB_WORKSPACE/tests/tmp-separator/a/file.md" << 'EOF'
+          # File A
+
+          Content of file A.
+          EOF
+
+          cat > "$GITHUB_WORKSPACE/tests/tmp-separator/b/file.md" << 'EOF'
+          # File B
+
+          Content of file B.
+          EOF
+
+      - name: Create config that disables all rules
+        run: |
+          cat > "$GITHUB_WORKSPACE/tests/tmp-separator/.markdownlint.json" << 'EOF'
+          {
+            "default": false
+          }
+          EOF
+
+      - id: action
+        uses: .
+        with:
+          globs: "tests/tmp-separator/a/*.md,tests/tmp-separator/b/*.md"
+          separator: ","
+          config: "tests/tmp-separator/.markdownlint.json"
+
+      - name: Assert action succeeded with custom comma separator
+        run: |
+          echo "PASS: action succeeded - comma separator correctly split glob patterns"

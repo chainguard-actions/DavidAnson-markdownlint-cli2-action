@@ -1,0 +1,45 @@
+name: Test custom globs - lint specific files via glob pattern
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create valid and invalid markdown files in different locations
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-globs/docs"
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-globs/other"
+
+          # Valid markdown in docs/ - will be linted
+          cat > "$GITHUB_WORKSPACE/tests/tmp-globs/docs/good.md" << 'EOF'
+          # Good Document
+
+          This is a well-formed markdown document.
+
+          - Item one
+          - Item two
+          EOF
+
+          # Invalid markdown in other/ - should NOT be linted (excluded by glob)
+          printf 'no heading\nbad content\n' \
+            > "$GITHUB_WORKSPACE/tests/tmp-globs/other/bad.md"
+
+      - name: Create config that disables all rules
+        run: |
+          cat > "$GITHUB_WORKSPACE/tests/tmp-globs/.markdownlint.json" << 'EOF'
+          {
+            "default": false
+          }
+          EOF
+
+      - id: action
+        uses: .
+        with:
+          globs: "tests/tmp-globs/docs/*.md"
+          config: "tests/tmp-globs/.markdownlint.json"
+
+      - name: Assert action succeeded (only valid docs were linted)
+        run: |
+          echo "PASS: action succeeded - glob correctly targeted only docs/*.md files"

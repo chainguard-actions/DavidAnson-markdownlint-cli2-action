@@ -3572,6 +3572,15 @@ const sanitizeRange = range => range.replace(
     : EMPTY
 )
 
+// > An optional `!` or `^` at the start of a class negates it, so that it
+// >   matches any character not in the set. (gitignore(5), fnmatch(3))
+// The leading `^` has already been escaped to `\^` by the metacharacter
+//   escaper, so we strip the literal `!` or escaped `^` and emit a single
+//   regex `^` which is the JavaScript negation token.
+const negateRange = range => range.startsWith('!') || range.startsWith('\\^')
+  ? `^${range.slice(range[0] === '!' ? 1 : 2)}`
+  : range
+
 // See fixtures #59
 const cleanRangeBackSlash = slashes => {
   const {length} = slashes
@@ -3676,7 +3685,7 @@ const REPLACERS = [
     // > "**/foo/bar" matches file or directory "bar" anywhere that is directly
     // >   under directory "foo".
     // Notice that the '*'s have been replaced as '\\*'
-    /^\^*\\\*\\\*\\\//,
+    /^\^*(?:\\\*\\\*\\\/)+/,
 
     // '**/foo' <-> 'foo'
     () => '^(?:.*\\/)?'
@@ -3787,7 +3796,7 @@ const REPLACERS = [
           // A normal case, and it is a range notation
           // '[bar]'
           // '[bar\\\\]'
-          ? `[${sanitizeRange(range)}${endEscape}]`
+          ? `[${negateRange(sanitizeRange(range))}${endEscape}]`
           // Invalid range notaton
           // '[bar\\]' -> '[bar\\\\]'
           : '[]'
@@ -13781,7 +13790,13 @@ function processHeader (request, key, val) {
       } else if (typeof val[i] === 'object') {
         throw new InvalidArgumentError(`invalid ${key} header`)
       } else {
-        arr.push(`${val[i]}`)
+        // Coerce primitives (and reject unsafe coercions such as functions
+        // with a crafted toString/Symbol.toPrimitive).
+        const str = `${val[i]}`
+        if (!isValidHeaderValue(str)) {
+          throw new InvalidArgumentError(`invalid ${key} header`)
+        }
+        arr.push(str)
       }
     }
     val = arr
@@ -13792,7 +13807,12 @@ function processHeader (request, key, val) {
   } else if (val === null) {
     val = ''
   } else {
+    // Coerce primitives (and reject unsafe coercions such as functions
+    // with a crafted toString/Symbol.toPrimitive).
     val = `${val}`
+    if (!isValidHeaderValue(val)) {
+      throw new InvalidArgumentError(`invalid ${key} header`)
+    }
   }
 
   if (headerName === 'host') {
@@ -14826,8 +14846,6 @@ function defaultFactory (origin, opts) {
 
 class Agent extends DispatcherBase {
   constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-    super()
-
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -14839,6 +14857,8 @@ class Agent extends DispatcherBase {
     if (!Number.isInteger(maxRedirections) || maxRedirections < 0) {
       throw new InvalidArgumentError('maxRedirections must be a positive number')
     }
+
+    super(options)
 
     if (connect && typeof connect !== 'function') {
       connect = { ...connect }
@@ -15164,6 +15184,7 @@ const {
   RequestContentLengthMismatchError,
   ResponseContentLengthMismatchError,
   RequestAbortedError,
+  InvalidArgumentError,
   HeadersTimeoutError,
   HeadersOverflowError,
   SocketError,
@@ -15211,6 +15232,9 @@ const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const addListener = util.addListener
 const removeAllListeners = util.removeAllListeners
+const kIdleSocketValidation = Symbol('kIdleSocketValidation')
+const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout')
+const kSocketUsed = Symbol('kSocketUsed')
 
 let extractBody
 
@@ -15433,27 +15457,69 @@ class Parser {
 
       const offset = llhttp.llhttp_get_error_pos(this.ptr) - currentBufferPtr
 
-      if (ret === constants.ERROR.PAUSED_UPGRADE) {
-        this.onUpgrade(data.slice(offset))
-      } else if (ret === constants.ERROR.PAUSED) {
-        this.paused = true
-        socket.unshift(data.slice(offset))
-      } else if (ret !== constants.ERROR.OK) {
-        const ptr = llhttp.llhttp_get_error_reason(this.ptr)
-        let message = ''
-        /* istanbul ignore else: difficult to make a test case for */
-        if (ptr) {
-          const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
-          message =
-            'Response does not match the HTTP/1.1 protocol (' +
-            Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-            ')'
+      if (ret !== constants.ERROR.OK) {
+        const body = data.subarray(offset)
+
+        if (ret === constants.ERROR.PAUSED_UPGRADE) {
+          this.onUpgrade(body)
+        } else if (ret === constants.ERROR.PAUSED) {
+          this.paused = true
+          socket.unshift(body)
+        } else {
+          throw this.createError(ret, body)
         }
-        throw new HTTPParserError(message, constants.ERROR[ret], data.slice(offset))
       }
     } catch (err) {
       util.destroy(socket, err)
     }
+  }
+
+  finish () {
+    assert(currentParser === null)
+    assert(this.ptr != null)
+    assert(!this.paused)
+
+    const { llhttp } = this
+
+    let ret
+
+    try {
+      currentParser = this
+      ret = llhttp.llhttp_finish(this.ptr)
+    } finally {
+      currentParser = null
+    }
+
+    if (ret === constants.ERROR.OK) {
+      return null
+    }
+
+    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+      this.paused = true
+      return null
+    }
+
+    return this.createError(ret, EMPTY_BUF)
+  }
+
+  createError (ret, data) {
+    const { llhttp, contentLength, bytesRead } = this
+
+    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const ptr = llhttp.llhttp_get_error_reason(this.ptr)
+    let message = ''
+    if (ptr) {
+      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+      message =
+        'Response does not match the HTTP/1.1 protocol (' +
+        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+        ')'
+    }
+
+    return new HTTPParserError(message, constants.ERROR[ret], data)
   }
 
   destroy () {
@@ -15480,6 +15546,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -15583,6 +15654,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -15759,6 +15835,7 @@ class Parser {
     request.onComplete(headers)
 
     client[kQueue][client[kRunningIdx]++] = null
+    socket[kSocketUsed] = true
 
     if (socket[kWriting]) {
       assert(client[kRunning] === 0)
@@ -15817,6 +15894,9 @@ async function connectH1 (client, socket) {
   socket[kWriting] = false
   socket[kReset] = false
   socket[kBlocking] = false
+  socket[kIdleSocketValidation] = 0
+  socket[kIdleSocketValidationTimeout] = null
+  socket[kSocketUsed] = false
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
@@ -15827,8 +15907,11 @@ async function connectH1 (client, socket) {
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
     // to the user.
     if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so for as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        this[kError] = parserErr
+        this[kClient][kOnError](parserErr)
+      }
       return
     }
 
@@ -15847,8 +15930,10 @@ async function connectH1 (client, socket) {
     const parser = this[kParser]
 
     if (parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so far as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        util.destroy(this, parserErr)
+      }
       return
     }
 
@@ -15858,10 +15943,11 @@ async function connectH1 (client, socket) {
     const client = this[kClient]
     const parser = this[kParser]
 
+    clearIdleSocketValidation(this)
+
     if (parser) {
       if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-        // We treat all incoming data so far as a valid response.
-        parser.onMessageComplete()
+        this[kError] = parser.finish() || this[kError]
       }
 
       this[kParser].destroy()
@@ -15924,7 +16010,7 @@ async function connectH1 (client, socket) {
       return socket.destroyed
     },
     busy (request) {
-      if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+      if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
         return true
       }
 
@@ -15962,6 +16048,31 @@ async function connectH1 (client, socket) {
   }
 }
 
+function clearIdleSocketValidation (socket) {
+  if (socket[kIdleSocketValidationTimeout]) {
+    clearTimeout(socket[kIdleSocketValidationTimeout])
+    socket[kIdleSocketValidationTimeout] = null
+  }
+
+  socket[kIdleSocketValidation] = 0
+}
+
+function scheduleIdleSocketValidation (client, socket) {
+  socket[kIdleSocketValidation] = 1
+  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+    socket[kIdleSocketValidationTimeout] = null
+    socket[kIdleSocketValidation] = 2
+
+    if (client[kSocket] === socket && !socket.destroyed) {
+      client[kResume]()
+    }
+  }, 0)
+  socket[kIdleSocketValidationTimeout].unref?.()
+}
+
+/**
+ * @param {import('./client.js')} client
+ */
 function resumeH1 (client) {
   const socket = client[kSocket]
 
@@ -15974,6 +16085,32 @@ function resumeH1 (client) {
     } else if (socket[kNoRef] && socket.ref) {
       socket.ref()
       socket[kNoRef] = false
+    }
+
+    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+      if (socket[kIdleSocketValidation] === 0) {
+        scheduleIdleSocketValidation(client, socket)
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+
+      if (socket[kIdleSocketValidation] === 1) {
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+    }
+
+    if (client[kRunning] === 0) {
+      socket[kParser].readMore()
+      if (socket.destroyed) {
+        return
+      }
     }
 
     if (client[kSize] === 0) {
@@ -16031,8 +16168,16 @@ function writeH1 (client, request) {
     }
     body = bodyStream.stream
     contentLength = bodyStream.length
-  } else if (util.isBlobLike(body) && request.contentType == null && body.type) {
-    headers.push('content-type', body.type)
+  } else if (util.isBlobLike(body) && request.contentType == null) {
+    const contentType = body.type
+    if (contentType) {
+      const contentTypeValue = `${contentType}`
+      if (!util.isValidHeaderValue(contentTypeValue)) {
+        util.errorRequest(client, request, new InvalidArgumentError('invalid content-type header'))
+        return false
+      }
+      headers.push('content-type', contentTypeValue)
+    }
   }
 
   if (body && typeof body.read === 'function') {
@@ -16069,6 +16214,7 @@ function writeH1 (client, request) {
   }
 
   const socket = client[kSocket]
+  clearIdleSocketValidation(socket)
 
   const abort = (err) => {
     if (request.aborted || request.completed) {
@@ -17388,9 +17534,10 @@ class Client extends DispatcherBase {
     autoSelectFamilyAttemptTimeout,
     // h2
     maxConcurrentStreams,
-    allowH2
+    allowH2,
+    webSocket
   } = {}) {
-    super()
+    super({ webSocket })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -17922,15 +18069,24 @@ const { kDestroy, kClose, kClosed, kDestroyed, kDispatch, kInterceptors } = __nc
 const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
+const kWebSocketOptions = Symbol('webSocketOptions')
 
 class DispatcherBase extends Dispatcher {
-  constructor () {
+  constructor (opts) {
     super()
 
     this[kDestroyed] = false
     this[kOnDestroyed] = null
     this[kClosed] = false
     this[kOnClosed] = []
+    this[kWebSocketOptions] = opts?.webSocket ?? {}
+  }
+
+  get webSocketOptions () {
+    return {
+      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
+      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
   }
 
   get destroyed () {
@@ -18490,8 +18646,8 @@ const kRemoveClient = Symbol('remove client')
 const kStats = Symbol('stats')
 
 class PoolBase extends DispatcherBase {
-  constructor () {
-    super()
+  constructor (opts) {
+    super(opts)
 
     this[kQueue] = new FixedQueue()
     this[kClients] = []
@@ -18750,8 +18906,6 @@ class Pool extends PoolBase {
     allowH2,
     ...options
   } = {}) {
-    super()
-
     if (connections != null && (!Number.isFinite(connections) || connections < 0)) {
       throw new InvalidArgumentError('invalid connections')
     }
@@ -18775,6 +18929,8 @@ class Pool extends PoolBase {
         ...connect
       })
     }
+
+    super(options)
 
     this[kInterceptors] = options.interceptors?.Pool && Array.isArray(options.interceptors.Pool)
       ? options.interceptors.Pool
@@ -19494,6 +19650,28 @@ function calculateRetryAfterHeader (retryAfter) {
   return new Date(retryAfter).getTime() - current
 }
 
+function validatePartialResponseContentLength (headers, range, statusCode, retryCount) {
+  const contentLength = headers['content-length']
+  if (contentLength == null) {
+    return null
+  }
+
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
+    return null
+  }
+
+  const length = Number(contentLength)
+  const expectedLength = range.end - range.start + 1
+  if (!Number.isFinite(length) || length !== expectedLength) {
+    return new RequestRetryError('Content-Length mismatch', statusCode, {
+      headers,
+      data: { count: retryCount }
+    })
+  }
+
+  return null
+}
+
 class RetryHandler {
   constructor (opts, handlers) {
     const { retryOptions, ...dispatchOpts } = opts
@@ -19708,6 +19886,12 @@ class RetryHandler {
         return false
       }
 
+      const contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount)
+      if (contentLengthError != null) {
+        this.abort(contentLengthError)
+        return false
+      }
+
       const { start, size, end = size - 1 } = contentRange
 
       assert(this.start === start, 'content-range mismatch')
@@ -19729,6 +19913,12 @@ class RetryHandler {
             resume,
             statusMessage
           )
+        }
+
+        const contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount)
+        if (contentLengthError != null) {
+          this.abort(contentLengthError)
+          return false
         }
 
         const { start, size, end = size - 1 } = range
@@ -23828,32 +24018,25 @@ function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) 
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    // 1. Let enforcement be "Default".
-    let enforcement = 'Default'
-
     const attributeValueLowercase = attributeValue.toLowerCase()
-    // 2. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", set enforcement to "None".
-    if (attributeValueLowercase.includes('none')) {
-      enforcement = 'None'
-    }
 
-    // 3. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Strict", set enforcement to "Strict".
-    if (attributeValueLowercase.includes('strict')) {
-      enforcement = 'Strict'
+    // 1. If cookie-av's attribute-value is a case-insensitive match for
+    //    "None", append an attribute to the cookie-attribute-list with an
+    //    attribute-name of "SameSite" and an attribute-value of "None".
+    if (attributeValueLowercase === 'none') {
+      cookieAttributeList.sameSite = 'None'
+    } else if (attributeValueLowercase === 'strict') {
+      // 2. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Strict", append an attribute to the cookie-attribute-list with
+      //    an attribute-name of "SameSite" and an attribute-value of
+      //    "Strict".
+      cookieAttributeList.sameSite = 'Strict'
+    } else if (attributeValueLowercase === 'lax') {
+      // 3. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Lax", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "Lax".
+      cookieAttributeList.sameSite = 'Lax'
     }
-
-    // 4. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Lax", set enforcement to "Lax".
-    if (attributeValueLowercase.includes('lax')) {
-      enforcement = 'Lax'
-    }
-
-    // 5. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of
-    //    enforcement.
-    cookieAttributeList.sameSite = enforcement
   } else {
     cookieAttributeList.unparsed ??= []
 
@@ -23982,7 +24165,7 @@ function validateCookiePath (path) {
 
     if (
       code < 0x20 || // exclude CTLs (0-31)
-      code === 0x7F || // DEL
+      code > 0x7E || // exclude DEL and non-ascii
       code === 0x3B // ;
     ) {
       throw new Error('Invalid cookie path')
@@ -23991,16 +24174,80 @@ function validateCookiePath (path) {
 }
 
 /**
- * I have no idea why these values aren't allowed to be honest,
- * but Deno tests these. - Khafra
+ * <let-dig> ::= <letter> | <digit>
+ *
+ * <letter> ::= any one of the 52 alphabetic characters A through Z in
+ * upper case and a through z in lower case
+ *
+ * <digit> ::= any one of the ten digits 0 through 9r
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @param {number} code
+ */
+function isLetterOrDigit (code) {
+  return (
+    (code >= 0x30 && code <= 0x39) || // 0-9
+    (code >= 0x41 && code <= 0x5A) || // A-Z
+    (code >= 0x61 && code <= 0x7A) // a-z
+  )
+}
+
+/**
+ * Validates a cookie domain against the "preferred name syntax".
+ *
+ * <domain>      ::= <subdomain> | " "
+ * <subdomain>   ::= <label> | <subdomain> "." <label>
+ * <label>       ::= <let-dig> [ [ <ldh-str> ] <let-dig> ]
+ * <ldh-str>     ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+ * <let-dig-hyp> ::= <let-dig> | "-"
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @see https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+ * @see https://www.rfc-editor.org/rfc/rfc1035#section-2.3.4
  * @param {string} domain
  */
 function validateCookieDomain (domain) {
-  if (
-    domain.startsWith('-') ||
-    domain.endsWith('.') ||
-    domain.endsWith('-')
-  ) {
+  // <domain> ::= <subdomain> | " "
+  if (domain === ' ') {
+    return
+  }
+
+  if (domain.length > 255) {
+    throw new Error('Invalid cookie domain')
+  }
+
+  let labelLength = 0
+
+  for (let i = 0; i < domain.length; ++i) {
+    const code = domain.charCodeAt(i)
+
+    if (code === 0x2E) {
+      if (labelLength === 0) {
+        throw new Error('Invalid cookie domain')
+      }
+
+      if (domain.charCodeAt(i - 1) === 0x2D) { // "-"
+        throw new Error('Invalid cookie domain')
+      }
+
+      labelLength = 0
+      continue
+    }
+
+    if (labelLength === 0 && !isLetterOrDigit(code)) {
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (!isLetterOrDigit(code) && code !== 0x2D) { // "-"
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (++labelLength > 63) {
+      throw new Error('Invalid cookie domain')
+    }
+  }
+
+  if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 0x2D) { // "-"
     throw new Error('Invalid cookie domain')
   }
 }
@@ -24143,7 +24390,13 @@ function stringify (cookie) {
 
     const [key, ...value] = part.split('=')
 
-    out.push(`${key.trim()}=${value.join('=')}`)
+    const trimmedKey = key.trim()
+    const joinedValue = value.join('=')
+
+    validateCookieName(trimmedKey)
+    validateCookieValue(joinedValue)
+
+    out.push(`${trimmedKey}=${joinedValue}`)
   }
 
   return out.join('; ')
@@ -36530,40 +36783,35 @@ const tail = Buffer.from([0x00, 0x00, 0xff, 0xff])
 const kBuffer = Symbol('kBuffer')
 const kLength = Symbol('kLength')
 
-// Default maximum decompressed message size: 4 MB
-const kDefaultMaxDecompressedSize = 4 * 1024 * 1024
-
 class PerMessageDeflate {
   /** @type {import('node:zlib').InflateRaw} */
   #inflate
 
   #options = {}
 
-  /** @type {boolean} */
-  #aborted = false
-
-  /** @type {Function|null} */
-  #currentCallback = null
+  #maxPayloadSize = 0
 
   /**
    * @param {Map<string, string>} extensions
    */
-  constructor (extensions) {
+  constructor (extensions, options) {
     this.#options.serverNoContextTakeover = extensions.has('server_no_context_takeover')
     this.#options.serverMaxWindowBits = extensions.get('server_max_window_bits')
+
+    this.#maxPayloadSize = options.maxPayloadSize
   }
 
+  /**
+   * Decompress a compressed payload.
+   * @param {Buffer} chunk Compressed data
+   * @param {boolean} fin Final fragment flag
+   * @param {Function} callback Callback function
+   */
   decompress (chunk, fin, callback) {
     // An endpoint uses the following algorithm to decompress a message.
     // 1.  Append 4 octets of 0x00 0x00 0xff 0xff to the tail end of the
     //     payload of the message.
     // 2.  Decompress the resulting data using DEFLATE.
-
-    if (this.#aborted) {
-      callback(new MessageSizeExceededError())
-      return
-    }
-
     if (!this.#inflate) {
       let windowBits = Z_DEFAULT_WINDOWBITS
 
@@ -36586,23 +36834,12 @@ class PerMessageDeflate {
       this.#inflate[kLength] = 0
 
       this.#inflate.on('data', (data) => {
-        if (this.#aborted) {
-          return
-        }
-
         this.#inflate[kLength] += data.length
 
-        if (this.#inflate[kLength] > kDefaultMaxDecompressedSize) {
-          this.#aborted = true
+        if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
+          callback(new MessageSizeExceededError())
           this.#inflate.removeAllListeners()
-          this.#inflate.destroy()
           this.#inflate = null
-
-          if (this.#currentCallback) {
-            const cb = this.#currentCallback
-            this.#currentCallback = null
-            cb(new MessageSizeExceededError())
-          }
           return
         }
 
@@ -36615,14 +36852,13 @@ class PerMessageDeflate {
       })
     }
 
-    this.#currentCallback = callback
     this.#inflate.write(chunk)
     if (fin) {
       this.#inflate.write(tail)
     }
 
     this.#inflate.flush(() => {
-      if (this.#aborted || !this.#inflate) {
+      if (!this.#inflate) {
         return
       }
 
@@ -36630,7 +36866,6 @@ class PerMessageDeflate {
 
       this.#inflate[kBuffer].length = 0
       this.#inflate[kLength] = 0
-      this.#currentCallback = null
 
       callback(null, full)
     })
@@ -36665,6 +36900,12 @@ const {
 const { WebsocketFrameSend } = __nccwpck_require__(3264)
 const { closeWebSocketConnection } = __nccwpck_require__(6897)
 const { PerMessageDeflate } = __nccwpck_require__(9469)
+const { MessageSizeExceededError } = __nccwpck_require__(8707)
+
+function failWebsocketConnectionWithCode (ws, code, reason) {
+  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
+  failWebsocketConnection(ws, reason)
+}
 
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -36673,6 +36914,7 @@ const { PerMessageDeflate } = __nccwpck_require__(9469)
 
 class ByteParser extends Writable {
   #buffers = []
+  #fragmentsBytes = 0
   #byteOffset = 0
   #loop = false
 
@@ -36684,18 +36926,27 @@ class ByteParser extends Writable {
   /** @type {Map<string, PerMessageDeflate>} */
   #extensions
 
+  /** @type {number} */
+  #maxFragments
+
+  /** @type {number} */
+  #maxPayloadSize
+
   /**
    * @param {import('./websocket').WebSocket} ws
    * @param {Map<string, string>|null} extensions
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
    */
-  constructor (ws, extensions) {
+  constructor (ws, extensions, options = {}) {
     super()
 
     this.ws = ws
     this.#extensions = extensions == null ? new Map() : extensions
+    this.#maxFragments = options.maxFragments ?? 0
+    this.#maxPayloadSize = options.maxPayloadSize ?? 0
 
     if (this.#extensions.has('permessage-deflate')) {
-      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions))
+      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options))
     }
   }
 
@@ -36709,6 +36960,19 @@ class ByteParser extends Writable {
     this.#loop = true
 
     this.run(callback)
+  }
+
+  #validatePayloadLength () {
+    if (
+      this.#maxPayloadSize > 0 &&
+      !isControlFrame(this.#info.opcode) &&
+      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
+      return false
+    }
+
+    return true
   }
 
   /**
@@ -36799,6 +37063,10 @@ class ByteParser extends Writable {
         if (payloadLength <= 125) {
           this.#info.payloadLength = payloadLength
           this.#state = parserStates.READ_DATA
+
+          if (!this.#validatePayloadLength()) {
+            return
+          }
         } else if (payloadLength === 126) {
           this.#state = parserStates.PAYLOADLENGTH_16
         } else if (payloadLength === 127) {
@@ -36823,6 +37091,10 @@ class ByteParser extends Writable {
 
         this.#info.payloadLength = buffer.readUInt16BE(0)
         this.#state = parserStates.READ_DATA
+
+        if (!this.#validatePayloadLength()) {
+          return
+        }
       } else if (this.#state === parserStates.PAYLOADLENGTH_64) {
         if (this.#byteOffset < 8) {
           return callback()
@@ -36845,6 +37117,10 @@ class ByteParser extends Writable {
 
         this.#info.payloadLength = lower
         this.#state = parserStates.READ_DATA
+
+        if (!this.#validatePayloadLength()) {
+          return
+        }
       } else if (this.#state === parserStates.READ_DATA) {
         if (this.#byteOffset < this.#info.payloadLength) {
           return callback()
@@ -36857,42 +37133,58 @@ class ByteParser extends Writable {
           this.#state = parserStates.INFO
         } else {
           if (!this.#info.compressed) {
-            this.#fragments.push(body)
+            if (!this.writeFragments(body)) {
+              return
+            }
+
+            if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
+              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
+              return
+            }
 
             // If the frame is not fragmented, a message has been received.
             // If the frame is fragmented, it will terminate with a fin bit set
             // and an opcode of 0 (continuation), therefore we handle that when
             // parsing continuation frames, not here.
             if (!this.#info.fragmented && this.#info.fin) {
-              const fullMessage = Buffer.concat(this.#fragments)
-              websocketMessageReceived(this.ws, this.#info.binaryType, fullMessage)
-              this.#fragments.length = 0
+              websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments())
             }
 
             this.#state = parserStates.INFO
           } else {
-            this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
-              if (error) {
-                failWebsocketConnection(this.ws, error.message)
-                return
-              }
+            this.#extensions.get('permessage-deflate').decompress(
+              body,
+              this.#info.fin,
+              (error, data) => {
+                if (error) {
+                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+                  failWebsocketConnectionWithCode(this.ws, code, error.message)
+                  return
+                }
 
-              this.#fragments.push(data)
+                if (!this.writeFragments(data)) {
+                  return
+                }
 
-              if (!this.#info.fin) {
-                this.#state = parserStates.INFO
+                if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
+                  failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
+                  return
+                }
+
+                if (!this.#info.fin) {
+                  this.#state = parserStates.INFO
+                  this.#loop = true
+                  this.run(callback)
+                  return
+                }
+
+                websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments())
+
                 this.#loop = true
+                this.#state = parserStates.INFO
                 this.run(callback)
-                return
               }
-
-              websocketMessageReceived(this.ws, this.#info.binaryType, Buffer.concat(this.#fragments))
-
-              this.#loop = true
-              this.#state = parserStates.INFO
-              this.#fragments.length = 0
-              this.run(callback)
-            })
+            )
 
             this.#loop = false
             break
@@ -36942,6 +37234,35 @@ class ByteParser extends Writable {
     this.#byteOffset -= n
 
     return buffer
+  }
+
+  writeFragments (fragment) {
+    if (
+      this.#maxFragments > 0 &&
+      this.#fragments.length === this.#maxFragments
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
+      return false
+    }
+
+    this.#fragmentsBytes += fragment.length
+    this.#fragments.push(fragment)
+    return true
+  }
+
+  consumeFragments () {
+    const fragments = this.#fragments
+
+    if (fragments.length === 1) {
+      this.#fragmentsBytes = 0
+      return fragments.shift()
+    }
+
+    const output = Buffer.concat(fragments, this.#fragmentsBytes)
+    this.#fragments = []
+    this.#fragmentsBytes = 0
+
+    return output
   }
 
   parseCloseBody (data) {
@@ -37975,7 +38296,14 @@ class WebSocket extends EventTarget {
     // once this happens, the connection is open
     this[kResponse] = response
 
-    const parser = new ByteParser(this, parsedExtensions)
+    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
+    const maxFragments = webSocketOptions?.maxFragments
+    const maxPayloadSize = webSocketOptions?.maxPayloadSize
+
+    const parser = new ByteParser(this, parsedExtensions, {
+      maxFragments,
+      maxPayloadSize
+    })
     parser.on('drain', onParserDrain)
     parser.on('error', onParserError.bind(this))
 
@@ -46963,7 +47291,7 @@ ParserInline.prototype.State = state_inline
   // All possible word characters (everything without punctuation, spaces & controls)
   // Defined via punctuation & spaces to save space
   // Should be something like \p{\L\N\S\M} (\w but without `_`)
-  re.src_pseudo_letter = '(?:(?!' + text_separators + '|' + re.src_ZPCc + ')' + re.src_Any + ')'
+  re.src_pseudo_letter = `(?:(?!${text_separators}|${re.src_ZPCc})${re.src_Any})`
   // The same as abothe but without [0-9]
   // var src_pseudo_letter_non_d = '(?:(?![0-9]|' + src_ZPCc + ')' + src_Any + ')';
 
@@ -46972,7 +47300,9 @@ ParserInline.prototype.State = state_inline
     '(?:(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)'
 
   // Prohibit any of "@/[]()" in user/pass to avoid wrong domain fetch.
-  re.src_auth = '(?:(?:(?!' + re.src_ZCc + '|[@/\\[\\]()]).)+@)?'
+  // Length is capped to exclude possible rescans till the end and avoid O(n^2)
+  // DoS. No standard limit, just take something reasonable.
+  re.src_auth = `(?:(?:(?!${re.src_ZCc}|[@/\\[\\]()]).){1,50}@)?`
 
   re.src_port =
 
@@ -46980,23 +47310,23 @@ ParserInline.prototype.State = state_inline
 
   re.src_host_terminator =
 
-    '(?=$|' + text_separators + '|' + re.src_ZPCc + ')' +
-    '(?!' + (opts['---'] ? '-(?!--)|' : '-|') + '_|:\\d|\\.-|\\.(?!$|' + re.src_ZPCc + '))'
+    `(?=$|${text_separators}|${re.src_ZPCc})` +
+    `(?!${opts['---'] ? '-(?!--)|' : '-|'}_|:\\d|\\.-|\\.(?!$|${re.src_ZPCc}))`
 
   re.src_path =
 
     '(?:' +
       '[/?#]' +
         '(?:' +
-          '(?!' + re.src_ZCc + '|' + text_separators + '|[()[\\]{}.,"\'?!\\-;]).|' +
-          '\\[(?:(?!' + re.src_ZCc + '|\\]).)*\\]|' +
-          '\\((?:(?!' + re.src_ZCc + '|[)]).)*\\)|' +
-          '\\{(?:(?!' + re.src_ZCc + '|[}]).)*\\}|' +
-          '\\"(?:(?!' + re.src_ZCc + '|["]).)+\\"|' +
-          "\\'(?:(?!" + re.src_ZCc + "|[']).)+\\'|" +
+          `(?!${re.src_ZCc}|${text_separators}|[()[\\]{}.,"'?!\\-;]).|` +
+          `\\[(?:(?!${re.src_ZCc}|\\]).)*\\]|` +
+          `\\((?:(?!${re.src_ZCc}|[)]).)*\\)|` +
+          `\\{(?:(?!${re.src_ZCc}|[}]).)*\\}|` +
+          `\\"(?:(?!${re.src_ZCc}|["]).)+\\"|` +
+          `\\'(?:(?!${re.src_ZCc}|[']).)+\\'|` +
 
           // allow `I'm_king` if no pair found
-          "\\'(?=" + re.src_pseudo_letter + '|[-])|' +
+          `\\'(?=${re.src_pseudo_letter}|[-])|` +
 
           // google has many dots in "google search" links (#66, #81).
           // github has ... in commit range links,
@@ -47008,30 +47338,32 @@ ParserInline.prototype.State = state_inline
           // until more examples found.
           '\\.{2,}[a-zA-Z0-9%/&]|' +
 
-          '\\.(?!' + re.src_ZCc + '|[.]|$)|' +
+          `\\.(?!${re.src_ZCc}|[.]|$)|` +
           (opts['---']
             ? '\\-(?!--(?:[^-]|$))(?:-*)|' // `---` => long dash, terminate
             : '\\-+|'
           ) +
           // allow `,,,` in paths
-          ',(?!' + re.src_ZCc + '|$)|' +
+          `,(?!${re.src_ZCc}|$)|` +
 
           // allow `;` if not followed by space-like char
-          ';(?!' + re.src_ZCc + '|$)|' +
+          `;(?!${re.src_ZCc}|$)|` +
 
           // allow `!!!` in paths, but not at the end
-          '\\!+(?!' + re.src_ZCc + '|[!]|$)|' +
+          `\\!+(?!${re.src_ZCc}|[!]|$)|` +
 
-          '\\?(?!' + re.src_ZCc + '|[?]|$)' +
+          `\\?(?!${re.src_ZCc}|[?]|$)` +
         ')+' +
       '|\\/' +
     ')?'
 
   // Allow anything in markdown spec, forbid quote (") at the first position
   // because emails enclosed in quotes are far more common
+  // Max name length capped to 64 chars (RFC 5321). This also prevents O(n^2)
+  // rescans to the end on inputs like `mailto:mailto:...`
   re.src_email_name =
 
-    '[\\-;:&=\\+\\$,\\.a-zA-Z0-9_][\\-;:&=\\+\\$,\\"\\.a-zA-Z0-9_]*'
+    '[\\-;:&=\\+\\$,\\.a-zA-Z0-9_][\\-;:&=\\+\\$,\\"\\.a-zA-Z0-9_]{0,63}'
 
   re.src_xn =
 
@@ -47046,7 +47378,7 @@ ParserInline.prototype.State = state_inline
     '(?:' +
       re.src_xn +
       '|' +
-      re.src_pseudo_letter + '{1,63}' +
+      `${re.src_pseudo_letter}{1,63}` +
     ')'
 
   re.src_domain =
@@ -47054,9 +47386,9 @@ ParserInline.prototype.State = state_inline
     '(?:' +
       re.src_xn +
       '|' +
-      '(?:' + re.src_pseudo_letter + ')' +
+      `(?:${re.src_pseudo_letter})` +
       '|' +
-      '(?:' + re.src_pseudo_letter + '(?:-|' + re.src_pseudo_letter + '){0,61}' + re.src_pseudo_letter + ')' +
+      `(?:${re.src_pseudo_letter}(?:-|${re.src_pseudo_letter}){0,61}${re.src_pseudo_letter})` +
     ')'
 
   re.src_host =
@@ -47065,7 +47397,7 @@ ParserInline.prototype.State = state_inline
     // Don't need IP check, because digits are already allowed in normal domain names
     //   src_ip4 +
     // '|' +
-      '(?:(?:(?:' + re.src_domain + ')\\.)*' + re.src_domain/* _root */ + ')' +
+      `(?:(?:(?:${re.src_domain})\\.)*${re.src_domain})`/* _root */ +
     ')'
 
   re.tpl_host_fuzzy =
@@ -47073,12 +47405,12 @@ ParserInline.prototype.State = state_inline
     '(?:' +
       re.src_ip4 +
     '|' +
-      '(?:(?:(?:' + re.src_domain + ')\\.)+(?:%TLDS%))' +
+      `(?:(?:(?:${re.src_domain})\\.)+(?:%TLDS%))` +
     ')'
 
   re.tpl_host_no_ip_fuzzy =
 
-    '(?:(?:(?:' + re.src_domain + ')\\.)+(?:%TLDS%))'
+    `(?:(?:(?:${re.src_domain})\\.)+(?:%TLDS%))`
 
   re.src_host_strict =
 
@@ -47107,24 +47439,24 @@ ParserInline.prototype.State = state_inline
   // Rude test fuzzy links by host, for quick deny
   re.tpl_host_fuzzy_test =
 
-    'localhost|www\\.|\\.\\d{1,3}\\.|(?:\\.(?:%TLDS%)(?:' + re.src_ZPCc + '|>|$))'
+    `localhost|www\\.|\\.\\d{1,3}\\.|(?:\\.(?:%TLDS%)(?:${re.src_ZPCc}|>|$))`
 
   re.tpl_email_fuzzy =
 
-      '(^|' + text_separators + '|"|\\(|' + re.src_ZCc + ')' +
-      '(' + re.src_email_name + '@' + re.tpl_host_fuzzy_strict + ')'
+      `(^|${text_separators}|"|\\(|${re.src_ZCc})` +
+      `(${re.src_email_name}@${re.tpl_host_fuzzy_strict})`
 
   re.tpl_link_fuzzy =
       // Fuzzy link can't be prepended with .:/\- and non punctuation.
       // but can start with > (markdown blockquote)
-      '(^|(?![.:/\\-_@])(?:[$+<=>^`|\uff5c]|' + re.src_ZPCc + '))' +
-      '((?![$+<=>^`|\uff5c])' + re.tpl_host_port_fuzzy_strict + re.src_path + ')'
+      `(^|(?![.:/\\-_@])(?:[$+<=>^\`|\uff5c]|${re.src_ZPCc}))` +
+      `((?![$+<=>^\`|\uff5c])${re.tpl_host_port_fuzzy_strict}${re.src_path})`
 
   re.tpl_link_no_ip_fuzzy =
       // Fuzzy link can't be prepended with .:/\- and non punctuation.
       // but can start with > (markdown blockquote)
-      '(^|(?![.:/\\-_@])(?:[$+<=>^`|\uff5c]|' + re.src_ZPCc + '))' +
-      '((?![$+<=>^`|\uff5c])' + re.tpl_host_port_no_ip_fuzzy_strict + re.src_path + ')'
+      `(^|(?![.:/\\-_@])(?:[$+<=>^\`|\uff5c]|${re.src_ZPCc}))` +
+      `((?![$+<=>^\`|\uff5c])${re.tpl_host_port_no_ip_fuzzy_strict}${re.src_path})`
 
   return re
 }
@@ -47183,7 +47515,7 @@ const defaultSchemas = {
       if (!self.re.http) {
         // compile lazily, because "host"-containing variables can change on tlds update.
         self.re.http = new RegExp(
-          '^\\/\\/' + self.re.src_auth + self.re.src_host_port_strict + self.re.src_path, 'i'
+          `^\\/\\/${self.re.src_auth}${self.re.src_host_port_strict}${self.re.src_path}`, 'i'
         )
       }
       if (self.re.http.test(tail)) {
@@ -47205,7 +47537,7 @@ const defaultSchemas = {
           self.re.src_auth +
           // Don't allow single-level domains, because of false positives like '//test'
           // with code comments
-          '(?:localhost|(?:(?:' + self.re.src_domain + ')\\.)+' + self.re.src_domain_root + ')' +
+          `(?:localhost|(?:(?:${self.re.src_domain})\\.)+${self.re.src_domain_root})` +
           self.re.src_port +
           self.re.src_host_terminator +
           self.re.src_path,
@@ -47229,7 +47561,7 @@ const defaultSchemas = {
 
       if (!self.re.mailto) {
         self.re.mailto = new RegExp(
-          '^' + self.re.src_email_name + '@' + self.re.src_host_strict, 'i'
+          `^${self.re.src_email_name}@${self.re.src_host_strict}`, 'i'
         )
       }
       if (self.re.mailto.test(tail)) {
@@ -47241,16 +47573,10 @@ const defaultSchemas = {
 }
 
 // RE pattern for 2-character tlds (autogenerated by ./support/tlds_2char_gen.js)
-/* eslint-disable-next-line max-len */
 const tlds_2ch_src_re = 'a[cdefgilmnoqrstuwxz]|b[abdefghijmnorstvwyz]|c[acdfghiklmnoruvwxyz]|d[ejkmoz]|e[cegrstu]|f[ijkmor]|g[abdefghilmnpqrstuwy]|h[kmnrtu]|i[delmnoqrst]|j[emop]|k[eghimnprwyz]|l[abcikrstuvy]|m[acdeghklmnopqrstuvwxyz]|n[acefgilopruz]|om|p[aefghklmnrstwy]|qa|r[eosuw]|s[abcdeghijklmnortuvxyz]|t[cdfghjklmnortvwz]|u[agksyz]|v[aceginu]|w[fs]|y[et]|z[amw]'
 
 // DON'T try to make PRs with changes. Extend TLDs with LinkifyIt.tlds() instead
 const tlds_default = 'biz|com|edu|gov|net|org|pro|web|xxx|aero|asia|coop|info|museum|name|shop|рф'.split('|')
-
-function resetScanCache (self) {
-  self.__index__ = -1
-  self.__text_cache__ = ''
-}
 
 function createValidator (re) {
   return function (text, pos) {
@@ -47290,8 +47616,11 @@ function compile (self) {
   function untpl (tpl) { return tpl.replace('%TLDS%', re.src_tlds) }
 
   re.email_fuzzy = RegExp(untpl(re.tpl_email_fuzzy), 'i')
+  re.email_fuzzy_global = RegExp(untpl(re.tpl_email_fuzzy), 'ig')
   re.link_fuzzy = RegExp(untpl(re.tpl_link_fuzzy), 'i')
+  re.link_fuzzy_global = RegExp(untpl(re.tpl_link_fuzzy), 'ig')
   re.link_no_ip_fuzzy = RegExp(untpl(re.tpl_link_no_ip_fuzzy), 'i')
+  re.link_no_ip_fuzzy_global = RegExp(untpl(re.tpl_link_no_ip_fuzzy), 'ig')
   re.host_fuzzy_test = RegExp(untpl(re.tpl_host_fuzzy_test), 'i')
 
   //
@@ -47303,7 +47632,7 @@ function compile (self) {
   self.__compiled__ = {} // Reset compiled data
 
   function schemaError (name, val) {
-    throw new Error('(LinkifyIt) Invalid schema "' + name + '": ' + val)
+    throw new Error(`(LinkifyIt) Invalid schema "${name}": ${val}`)
   }
 
   Object.keys(self.__schemas__).forEach(function (name) {
@@ -47377,20 +47706,14 @@ function compile (self) {
     .map(linkify_it_escapeRE)
     .join('|')
   // (?!_) cause 1.5x slowdown
-  self.re.schema_test = RegExp('(^|(?!_)(?:[><\uff5c]|' + re.src_ZPCc + '))(' + slist + ')', 'i')
-  self.re.schema_search = RegExp('(^|(?!_)(?:[><\uff5c]|' + re.src_ZPCc + '))(' + slist + ')', 'ig')
-  self.re.schema_at_start = RegExp('^' + self.re.schema_search.source, 'i')
+  self.re.schema_test = RegExp(`(^|(?!_)(?:[><\uff5c]|${re.src_ZPCc}))(${slist})`, 'i')
+  self.re.schema_search = RegExp(`(^|(?!_)(?:[><\uff5c]|${re.src_ZPCc}))(${slist})`, 'ig')
+  self.re.schema_at_start = RegExp(`^${self.re.schema_search.source}`, 'i')
 
   self.re.pretest = RegExp(
-    '(' + self.re.schema_test.source + ')|(' + self.re.host_fuzzy_test.source + ')|@',
+    `(${self.re.schema_test.source})|(${self.re.host_fuzzy_test.source})|@`,
     'i'
   )
-
-  //
-  // Cleanup
-  //
-
-  resetScanCache(self)
 }
 
 /**
@@ -47398,55 +47721,45 @@ function compile (self) {
  *
  * Match result. Single element of array, returned by [[LinkifyIt#match]]
  **/
-function Match (self, shift) {
-  const start = self.__index__
-  const end = self.__last_index__
-  const text = self.__text_cache__.slice(start, end)
+function Match (text, schema, index, lastIndex) {
+  const raw = text.slice(index, lastIndex)
 
   /**
    * Match#schema -> String
    *
    * Prefix (protocol) for matched string.
    **/
-  this.schema = self.__schema__.toLowerCase()
+  this.schema = schema.toLowerCase()
   /**
    * Match#index -> Number
    *
    * First position of matched string.
    **/
-  this.index = start + shift
+  this.index = index
   /**
    * Match#lastIndex -> Number
    *
    * Next position after matched string.
    **/
-  this.lastIndex = end + shift
+  this.lastIndex = lastIndex
   /**
    * Match#raw -> String
    *
    * Matched string.
    **/
-  this.raw = text
+  this.raw = raw
   /**
    * Match#text -> String
    *
    * Notmalized text of matched string.
    **/
-  this.text = text
+  this.text = raw
   /**
    * Match#url -> String
    *
    * Normalized url of matched string.
    **/
-  this.url = text
-}
-
-function createMatch (self, shift) {
-  const match = new Match(self, shift)
-
-  self.__compiled__[match.schema].normalize(match, self)
-
-  return match
+  this.url = raw
 }
 
 /**
@@ -47501,12 +47814,6 @@ function LinkifyIt (schemas, options) {
 
   this.__opts__ = linkify_it_assign({}, defaultOptions, options)
 
-  // Cache last tested result. Used to skip repeating steps on next `match` call.
-  this.__index__ = -1
-  this.__last_index__ = -1 // Next scan position
-  this.__schema__ = ''
-  this.__text_cache__ = ''
-
   this.__schemas__ = linkify_it_assign({}, defaultSchemas, schemas)
   this.__compiled__ = {}
 
@@ -47548,69 +47855,38 @@ LinkifyIt.prototype.set = function set (options) {
  * Searches linkifiable pattern and returns `true` on success or `false` on fail.
  **/
 LinkifyIt.prototype.test = function test (text) {
-  // Reset scan cache
-  this.__text_cache__ = text
-  this.__index__ = -1
-
   if (!text.length) { return false }
 
-  let m, ml, me, len, shift, next, re, tld_pos, at_pos
+  let m, re
 
   // try to scan for link with schema - that's the most simple rule
   if (this.re.schema_test.test(text)) {
     re = this.re.schema_search
     re.lastIndex = 0
     while ((m = re.exec(text)) !== null) {
-      len = this.testSchemaAt(text, m[2], re.lastIndex)
-      if (len) {
-        this.__schema__ = m[2]
-        this.__index__ = m.index + m[1].length
-        this.__last_index__ = m.index + m[0].length + len
-        break
-      }
+      if (this.testSchemaAt(text, m[2], re.lastIndex)) { return true }
     }
   }
 
   if (this.__opts__.fuzzyLink && this.__compiled__['http:']) {
     // guess schemaless links
-    tld_pos = text.search(this.re.host_fuzzy_test)
-    if (tld_pos >= 0) {
-      // if tld is located after found link - no need to check fuzzy pattern
-      if (this.__index__ < 0 || tld_pos < this.__index__) {
-        if ((ml = text.match(this.__opts__.fuzzyIP ? this.re.link_fuzzy : this.re.link_no_ip_fuzzy)) !== null) {
-          shift = ml.index + ml[1].length
-
-          if (this.__index__ < 0 || shift < this.__index__) {
-            this.__schema__ = ''
-            this.__index__ = shift
-            this.__last_index__ = ml.index + ml[0].length
-          }
-        }
+    if (text.search(this.re.host_fuzzy_test) >= 0) {
+      if (text.match(this.__opts__.fuzzyIP ? this.re.link_fuzzy : this.re.link_no_ip_fuzzy) !== null) {
+        return true
       }
     }
   }
 
   if (this.__opts__.fuzzyEmail && this.__compiled__['mailto:']) {
     // guess schemaless emails
-    at_pos = text.indexOf('@')
-    if (at_pos >= 0) {
+    if (text.indexOf('@') >= 0) {
       // We can't skip this check, because this cases are possible:
       // 192.168.1.1@gmail.com, my.in@example.com
-      if ((me = text.match(this.re.email_fuzzy)) !== null) {
-        shift = me.index + me[1].length
-        next = me.index + me[0].length
-
-        if (this.__index__ < 0 || shift < this.__index__ ||
-            (shift === this.__index__ && next > this.__last_index__)) {
-          this.__schema__ = 'mailto:'
-          this.__index__ = shift
-          this.__last_index__ = next
-        }
-      }
+      if (text.match(this.re.email_fuzzy) !== null) { return true }
     }
   }
 
-  return this.__index__ >= 0
+  return false
 }
 
 /**
@@ -47659,23 +47935,88 @@ LinkifyIt.prototype.testSchemaAt = function testSchemaAt (text, schema, pos) {
  **/
 LinkifyIt.prototype.match = function match (text) {
   const result = []
-  let shift = 0
+  const type_schemed = []
+  const type_fuzzy_link = []
+  const type_fuzzy_email = []
+  let m, len, re
 
-  // Try to take previous element from cache, if .test() called before
-  if (this.__index__ >= 0 && this.__text_cache__ === text) {
-    result.push(createMatch(this, shift))
-    shift = this.__last_index__
+  function choose (a, b) {
+    if (!a) { return b }
+    if (!b) { return a }
+    if (a.index !== b.index) { return a.index < b.index ? a : b }
+    return a.lastIndex >= b.lastIndex ? a : b
   }
 
-  // Cut head if cache was used
-  let tail = shift ? text.slice(shift) : text
+  if (!text.length) { return null }
 
-  // Scan string until end reached
-  while (this.test(tail)) {
-    result.push(createMatch(this, shift))
+  // scan for links with schema
+  if (this.re.schema_test.test(text)) {
+    re = this.re.schema_search
+    re.lastIndex = 0
+    while ((m = re.exec(text)) !== null) {
+      len = this.testSchemaAt(text, m[2], re.lastIndex)
+      if (len) {
+        type_schemed.push({
+          schema: m[2],
+          index: m.index + m[1].length,
+          lastIndex: m.index + m[0].length + len
+        })
+      }
+    }
+  }
 
-    tail = tail.slice(this.__last_index__)
-    shift += this.__last_index__
+  if (this.__opts__.fuzzyLink && this.__compiled__['http:']) {
+    re = this.__opts__.fuzzyIP ? this.re.link_fuzzy_global : this.re.link_no_ip_fuzzy_global
+    re.lastIndex = 0
+    while ((m = re.exec(text)) !== null) {
+      type_fuzzy_link.push({
+        schema: '',
+        index: m.index + m[1].length,
+        lastIndex: m.index + m[0].length
+      })
+    }
+  }
+
+  if (this.__opts__.fuzzyEmail && this.__compiled__['mailto:']) {
+    re = this.re.email_fuzzy_global
+    re.lastIndex = 0
+    while ((m = re.exec(text)) !== null) {
+      type_fuzzy_email.push({
+        schema: 'mailto:',
+        index: m.index + m[1].length,
+        lastIndex: m.index + m[0].length
+      })
+    }
+  }
+
+  const indexes = [0, 0, 0]
+  let lastIndex = 0
+
+  for (;;) {
+    const candidates = [
+      type_schemed[indexes[0]],
+      type_fuzzy_email[indexes[1]],
+      type_fuzzy_link[indexes[2]]
+    ]
+
+    const candidate = choose(choose(candidates[0], candidates[1]), candidates[2])
+
+    if (!candidate) { break }
+
+    if (candidate === candidates[0]) {
+      indexes[0]++
+    } else if (candidate === candidates[1]) {
+      indexes[1]++
+    } else {
+      indexes[2]++
+    }
+
+    if (candidate.index < lastIndex) { continue }
+
+    const match = new Match(text, candidate.schema, candidate.index, candidate.lastIndex)
+    this.__compiled__[match.schema].normalize(match, this)
+    result.push(match)
+    lastIndex = candidate.lastIndex
   }
 
   if (result.length) {
@@ -47692,10 +48033,6 @@ LinkifyIt.prototype.match = function match (text) {
  * of the string, and null otherwise.
  **/
 LinkifyIt.prototype.matchAtStart = function matchAtStart (text) {
-  // Reset scan cache
-  this.__text_cache__ = text
-  this.__index__ = -1
-
   if (!text.length) return null
 
   const m = this.re.schema_at_start.exec(text)
@@ -47704,11 +48041,10 @@ LinkifyIt.prototype.matchAtStart = function matchAtStart (text) {
   const len = this.testSchemaAt(text, m[2], m[0].length)
   if (!len) return null
 
-  this.__schema__ = m[2]
-  this.__index__ = m.index + m[1].length
-  this.__last_index__ = m.index + m[0].length + len
+  const match = new Match(text, m[2], m.index + m[1].length, m.index + m[0].length + len)
 
-  return createMatch(this, 0)
+  this.__compiled__[match.schema].normalize(match, this)
+  return match
 }
 
 /** chainable
@@ -47756,10 +48092,10 @@ LinkifyIt.prototype.normalize = function normalize (match) {
   // Do minimal possible changes by default. Need to collect feedback prior
   // to move forward https://github.com/markdown-it/linkify-it/issues/1
 
-  if (!match.schema) { match.url = 'http://' + match.url }
+  if (!match.schema) { match.url = `http://${match.url}` }
 
   if (match.schema === 'mailto:' && !/^mailto:/i.test(match.url)) {
-    match.url = 'mailto:' + match.url
+    match.url = `mailto:${match.url}`
   }
 }
 
@@ -71630,8 +71966,9 @@ function ansiRegex({onlyFirst = false} = {}) {
 	// Valid string terminator sequences are BEL, ESC\, and 0x9c
 	const ST = '(?:\\u0007|\\u001B\\u005C|\\u009C)';
 
-	// OSC sequences only: ESC ] ... ST (non-greedy until the first ST)
-	const osc = `(?:\\u001B\\][\\s\\S]*?${ST})`;
+	// OSC sequences only: ESC ] ... ST
+	// The payload stops at the first terminator character rather than scanning ahead for one, so an unterminated `ESC ]` cannot rescan the rest of the input. Terminals likewise abort a control string on an unexpected ESC.
+	const osc = `(?:\\u001B\\][^\\u0007\\u001B\\u009C]*${ST})`;
 
 	// CSI and related: ESC/C1, optional intermediates, optional params (supports ; and :) then final byte
 	const csi = '[\\u001B\\u009B][[\\]()#;?]*(?:\\d{1,4}(?:[;:]\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]';
@@ -71665,22 +72002,25 @@ function stripAnsi(string) {
 ;// CONCATENATED MODULE: ./node_modules/get-east-asian-width/lookup-data.js
 // Generated by scripts/build.js
 
-// prettier-ignore
+const ambiguousMinimalCodePoint = 161;
+const ambiguousMaximumCodePoint = 1114109;
 const ambiguousRanges = [161, 161, 164, 164, 167, 168, 170, 170, 173, 174, 176, 180, 182, 186, 188, 191, 198, 198, 208, 208, 215, 216, 222, 225, 230, 230, 232, 234, 236, 237, 240, 240, 242, 243, 247, 250, 252, 252, 254, 254, 257, 257, 273, 273, 275, 275, 283, 283, 294, 295, 299, 299, 305, 307, 312, 312, 319, 322, 324, 324, 328, 331, 333, 333, 338, 339, 358, 359, 363, 363, 462, 462, 464, 464, 466, 466, 468, 468, 470, 470, 472, 472, 474, 474, 476, 476, 593, 593, 609, 609, 708, 708, 711, 711, 713, 715, 717, 717, 720, 720, 728, 731, 733, 733, 735, 735, 768, 879, 913, 929, 931, 937, 945, 961, 963, 969, 1025, 1025, 1040, 1103, 1105, 1105, 8208, 8208, 8211, 8214, 8216, 8217, 8220, 8221, 8224, 8226, 8228, 8231, 8240, 8240, 8242, 8243, 8245, 8245, 8251, 8251, 8254, 8254, 8308, 8308, 8319, 8319, 8321, 8324, 8364, 8364, 8451, 8451, 8453, 8453, 8457, 8457, 8467, 8467, 8470, 8470, 8481, 8482, 8486, 8486, 8491, 8491, 8531, 8532, 8539, 8542, 8544, 8555, 8560, 8569, 8585, 8585, 8592, 8601, 8632, 8633, 8658, 8658, 8660, 8660, 8679, 8679, 8704, 8704, 8706, 8707, 8711, 8712, 8715, 8715, 8719, 8719, 8721, 8721, 8725, 8725, 8730, 8730, 8733, 8736, 8739, 8739, 8741, 8741, 8743, 8748, 8750, 8750, 8756, 8759, 8764, 8765, 8776, 8776, 8780, 8780, 8786, 8786, 8800, 8801, 8804, 8807, 8810, 8811, 8814, 8815, 8834, 8835, 8838, 8839, 8853, 8853, 8857, 8857, 8869, 8869, 8895, 8895, 8978, 8978, 9312, 9449, 9451, 9547, 9552, 9587, 9600, 9615, 9618, 9621, 9632, 9633, 9635, 9641, 9650, 9651, 9654, 9655, 9660, 9661, 9664, 9665, 9670, 9672, 9675, 9675, 9678, 9681, 9698, 9701, 9711, 9711, 9733, 9734, 9737, 9737, 9742, 9743, 9756, 9756, 9758, 9758, 9792, 9792, 9794, 9794, 9824, 9825, 9827, 9829, 9831, 9834, 9836, 9837, 9839, 9839, 9886, 9887, 9919, 9919, 9926, 9933, 9935, 9939, 9941, 9953, 9955, 9955, 9960, 9961, 9963, 9969, 9972, 9972, 9974, 9977, 9979, 9980, 9982, 9983, 10045, 10045, 10102, 10111, 11094, 11097, 12872, 12879, 57344, 63743, 65024, 65039, 65533, 65533, 127232, 127242, 127248, 127277, 127280, 127337, 127344, 127373, 127375, 127376, 127387, 127404, 917760, 917999, 983040, 1048573, 1048576, 1114109];
 
-// prettier-ignore
+const fullwidthMinimalCodePoint = 12288;
+const fullwidthMaximumCodePoint = 65510;
 const fullwidthRanges = [12288, 12288, 65281, 65376, 65504, 65510];
 
-// prettier-ignore
-const lookup_data_halfwidthRanges = [8361, 8361, 65377, 65470, 65474, 65479, 65482, 65487, 65490, 65495, 65498, 65500, 65512, 65518];
+const lookup_data_halfwidthMinimalCodePoint = 8361;
+const lookup_data_halfwidthMaximumCodePoint = 65518;
+const lookup_data_halfwidthRanges = (/* unused pure expression or super */ null && ([8361, 8361, 65377, 65470, 65474, 65479, 65482, 65487, 65490, 65495, 65498, 65500, 65512, 65518]));
 
-// prettier-ignore
-const lookup_data_narrowRanges = [32, 126, 162, 163, 165, 166, 172, 172, 175, 175, 10214, 10221, 10629, 10630];
+const lookup_data_narrowMinimalCodePoint = 32;
+const lookup_data_narrowMaximumCodePoint = 10630;
+const lookup_data_narrowRanges = (/* unused pure expression or super */ null && ([32, 126, 162, 163, 165, 166, 172, 172, 175, 175, 10214, 10221, 10629, 10630]));
 
-// prettier-ignore
+const wideMinimalCodePoint = 4352;
+const wideMaximumCodePoint = 262141;
 const wideRanges = [4352, 4447, 8986, 8987, 9001, 9002, 9193, 9196, 9200, 9200, 9203, 9203, 9725, 9726, 9748, 9749, 9776, 9783, 9800, 9811, 9855, 9855, 9866, 9871, 9875, 9875, 9889, 9889, 9898, 9899, 9917, 9918, 9924, 9925, 9934, 9934, 9940, 9940, 9962, 9962, 9970, 9971, 9973, 9973, 9978, 9978, 9981, 9981, 9989, 9989, 9994, 9995, 10024, 10024, 10060, 10060, 10062, 10062, 10067, 10069, 10071, 10071, 10133, 10135, 10160, 10160, 10175, 10175, 11035, 11036, 11088, 11088, 11093, 11093, 11904, 11929, 11931, 12019, 12032, 12245, 12272, 12287, 12289, 12350, 12353, 12438, 12441, 12543, 12549, 12591, 12593, 12686, 12688, 12773, 12783, 12830, 12832, 12871, 12880, 42124, 42128, 42182, 43360, 43388, 44032, 55203, 63744, 64255, 65040, 65049, 65072, 65106, 65108, 65126, 65128, 65131, 94176, 94180, 94192, 94198, 94208, 101589, 101631, 101662, 101760, 101874, 110576, 110579, 110581, 110587, 110589, 110590, 110592, 110882, 110898, 110898, 110928, 110930, 110933, 110933, 110948, 110951, 110960, 111355, 119552, 119638, 119648, 119670, 126980, 126980, 127183, 127183, 127374, 127374, 127377, 127386, 127488, 127490, 127504, 127547, 127552, 127560, 127568, 127569, 127584, 127589, 127744, 127776, 127789, 127797, 127799, 127868, 127870, 127891, 127904, 127946, 127951, 127955, 127968, 127984, 127988, 127988, 127992, 128062, 128064, 128064, 128066, 128252, 128255, 128317, 128331, 128334, 128336, 128359, 128378, 128378, 128405, 128406, 128420, 128420, 128507, 128591, 128640, 128709, 128716, 128716, 128720, 128722, 128725, 128728, 128732, 128735, 128747, 128748, 128756, 128764, 128992, 129003, 129008, 129008, 129292, 129338, 129340, 129349, 129351, 129535, 129648, 129660, 129664, 129674, 129678, 129734, 129736, 129736, 129741, 129756, 129759, 129770, 129775, 129784, 131072, 196605, 196608, 262141];
-
-
 
 ;// CONCATENATED MODULE: ./node_modules/get-east-asian-width/utilities.js
 /**
@@ -71712,19 +72052,8 @@ const utilities_isInRange = (ranges, codePoint) => {
 
 
 
-const minimumAmbiguousCodePoint = ambiguousRanges[0];
-const maximumAmbiguousCodePoint = ambiguousRanges.at(-1);
-const minimumFullWidthCodePoint = fullwidthRanges[0];
-const maximumFullWidthCodePoint = fullwidthRanges.at(-1);
-const minimumHalfWidthCodePoint = lookup_data_halfwidthRanges[0];
-const maximumHalfWidthCodePoint = lookup_data_halfwidthRanges.at(-1);
-const minimumNarrowCodePoint = lookup_data_narrowRanges[0];
-const maximumNarrowCodePoint = lookup_data_narrowRanges.at(-1);
-const minimumWideCodePoint = wideRanges[0];
-const maximumWideCodePoint = wideRanges.at(-1);
-
 const commonCjkCodePoint = 0x4E_00;
-const [wideFastPathStart, wideFastPathEnd] = findWideFastPathRange(wideRanges);
+const [wideFastPathStart, wideFastPathEnd] = /* #__PURE__ */ findWideFastPathRange(wideRanges);
 
 // Use a hot-path range so common `isWide` calls can skip binary search.
 // The range containing U+4E00 covers common CJK ideographs;
@@ -71755,8 +72084,8 @@ function findWideFastPathRange(ranges) {
 
 const isAmbiguous = codePoint => {
 	if (
-		codePoint < minimumAmbiguousCodePoint
-		|| codePoint > maximumAmbiguousCodePoint
+		codePoint < ambiguousMinimalCodePoint
+		|| codePoint > ambiguousMaximumCodePoint
 	) {
 		return false;
 	}
@@ -71766,8 +72095,8 @@ const isAmbiguous = codePoint => {
 
 const isFullWidth = codePoint => {
 	if (
-		codePoint < minimumFullWidthCodePoint
-		|| codePoint > maximumFullWidthCodePoint
+		codePoint < fullwidthMinimalCodePoint
+		|| codePoint > fullwidthMaximumCodePoint
 	) {
 		return false;
 	}
@@ -71777,8 +72106,8 @@ const isFullWidth = codePoint => {
 
 const isHalfWidth = codePoint => {
 	if (
-		codePoint < minimumHalfWidthCodePoint
-		|| codePoint > maximumHalfWidthCodePoint
+		codePoint < halfwidthMinimalCodePoint
+		|| codePoint > halfwidthMaximumCodePoint
 	) {
 		return false;
 	}
@@ -71788,8 +72117,8 @@ const isHalfWidth = codePoint => {
 
 const isNarrow = codePoint => {
 	if (
-		codePoint < minimumNarrowCodePoint
-		|| codePoint > maximumNarrowCodePoint
+		codePoint < narrowMinimalCodePoint
+		|| codePoint > narrowMaximumCodePoint
 	) {
 		return false;
 	}
@@ -71806,8 +72135,8 @@ const isWide = codePoint => {
 	}
 
 	if (
-		codePoint < minimumWideCodePoint
-		|| codePoint > maximumWideCodePoint
+		codePoint < wideMinimalCodePoint
+		|| codePoint > wideMaximumCodePoint
 	) {
 		return false;
 	}

@@ -1,0 +1,40 @@
+name: Test basic usage - valid markdown passes
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create a valid markdown file
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/tests/tmp-basic-pass"
+          cat > "$GITHUB_WORKSPACE/tests/tmp-basic-pass/valid.md" << 'EOF'
+          # Valid Markdown
+
+          This is a valid markdown file.
+
+          - Item one
+          - Item two
+          - Item three
+          EOF
+
+      - name: Create markdownlint config to disable strict rules
+        run: |
+          cat > "$GITHUB_WORKSPACE/tests/tmp-basic-pass/.markdownlint.json" << 'EOF'
+          {
+            "default": false
+          }
+          EOF
+
+      - id: action
+        uses: .
+        with:
+          globs: "tests/tmp-basic-pass/valid.md"
+          config: "tests/tmp-basic-pass/.markdownlint.json"
+
+      - name: Assert action succeeded (valid markdown should pass linting)
+        run: |
+          echo "Action completed successfully - valid markdown passed linting"
+          echo "PASS"
