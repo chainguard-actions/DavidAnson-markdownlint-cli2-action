@@ -1,0 +1,12 @@
+{
+  "status": "self_contained",
+  "entries": [
+    {
+      "path": "dist/index.mjs",
+      "status": "self_contained",
+      "warnings": [
+        "unsupported-dynamic-import: This \"import\" expression will not be bundled because the argument is not a string literal"
+      ]
+    }
+  ]
+}
