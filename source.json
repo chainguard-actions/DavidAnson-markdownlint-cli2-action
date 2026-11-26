@@ -1,6 +1,16 @@
 {
   "owner": "DavidAnson",
   "repo": "markdownlint-cli2-action",
-  "version": "",
-  "url": "https://github.com/DavidAnson/markdownlint-cli2-action"
+  "version": "v25.1.0",
+  "commit_sha": "3ce8f712b5d8f31acd8e201be6d97e3d2bb23eb7",
+  "url": "https://github.com/DavidAnson/markdownlint-cli2-action",
+  "policy_sha": "374911c4be584df24e6da57af2d990570ef0f859",
+  "test_policy_sha": "843adf9e4b8f85d0c08b27b9d0b09dd094b54702",
+  "test_agent_version": "2",
+  "harden_agent_version": "2",
+  "dist_artifact": {
+    "gcs_uri": "gs://patch-actions-node-artifacts/dist-artifacts/DavidAnson/markdownlint-cli2-action/v25.1.0/sha256-70492fd68675c62808fa356e05d55a310647185527ade647a8a9715bde1801fa.tar.gz",
+    "sha256": "70492fd68675c62808fa356e05d55a310647185527ade647a8a9715bde1801fa",
+    "size_bytes": 698784
+  }
 }
